@@ -1,0 +1,392 @@
+// An MCP server: a set of tools, and the HTTP transport that carries them.
+//
+// The shape is borrowed from glyde, which is a Discord library rather than an
+// MCP one but has the ergonomics this wants: a value you build up by handing it
+// handlers, and a `serve` at the end that starts it. A tool is a record with a
+// closure in it, so the thing a tool needs — a Redis pool, say — is captured
+// when the tool is built and never has to be threaded through the transport.
+//
+//	server = server.tools(server.new('heddle', '0.1.0'), tools.all(pool))
+//	server.serve(server, '0.0.0.0', 7823)
+//
+// The transport is Streamable HTTP with the streaming left out. Every request
+// is a POST carrying one JSON-RPC message and every reply is one JSON object,
+// which is all the tool surface here needs — nothing it does is long-running
+// enough to want an event stream, and a server that never opens one is a server
+// with no stream state to lose. GET is refused rather than upgraded to SSE.
+//
+// No session id is issued. The spec leaves that to the server, and Heddle's
+// state lives in Redis under keys the caller names, so there is nothing in the
+// connection worth remembering between requests.
+
+import scarlet/array
+import scarlet/binary
+import scarlet/http.{Delete, Fixed, Get, Options, Post, Request, Response}
+import scarlet/http/body
+import scarlet/http/headers
+import scarlet/http/headers.{Header}
+import scarlet/net.{Service}
+import scarlet/net/error.{NetError}
+import scarlet/option
+import scarlet/result
+import ./json.{Boolean, Json, List, Null, Object, Text}
+import ./rpc.{Call, Id, NoId}
+
+/** The revision of MCP this server speaks. */
+pub const PROTOCOL_VERSION = '2025-06-18'
+
+/** What a tool hands back. */
+pub type Outcome {
+	/** It worked. The text is what the model reads. */
+	Reply(text String)
+	/** It worked, and there is machine-readable detail alongside the text. */
+	Detailed(text String, data Json)
+	/**
+	 * It ran and failed. This is a *result*, not a protocol error: the model
+	 * sees the reason and can act on it, which is the whole point of the
+	 * distinction MCP draws here.
+	 */
+	Failed(text String)
+}
+
+pub type Tool {
+	/** The name the model calls, and the key it is looked up by. */
+	name String
+	/** A human label for a tool picker. */
+	title String
+	description String
+	/** JSON Schema for the arguments; see `./schema`. */
+	schema Json
+	/** Run it. The argument is the `arguments` object, `Object([])` if absent. */
+	run fn(Json) Outcome
+}
+
+pub type Server {
+	name String
+	version String
+	instructions String
+	tools Array(Tool)
+	/** A bearer token every request must carry. Empty means auth is off. */
+	token String
+	/** The path a `GET` returns a JSON snapshot on. Empty means there is none. */
+	status_path String
+	/** What to run for that snapshot. Ignored while `status_path` is empty. */
+	status_run fn() Json
+	/** The path a `GET` returns the dashboard's HTML on. Empty means there is none. */
+	dashboard_path String
+	/** The HTML to serve there. Ignored while `dashboard_path` is empty. */
+	dashboard_html String
+}
+
+pub fn new(name String, version String) Server {
+	Server(
+		name: name,
+		version: version,
+		instructions: '',
+		tools: [],
+		token: '',
+		status_path: '',
+		status_run: fn() Null,
+		dashboard_path: '',
+		dashboard_html: '',
+	)
+}
+
+/** Instructions the client shows the model alongside the tool list. */
+pub fn guide(s Server, text String) Server {
+	Server(..s, instructions: text)
+}
+
+/**
+ * Require `Authorization: Bearer <token>` on every request. An empty token
+ * turns the check back off, which is what a fresh `Server` already has —
+ * this exists for the case where the token came from an env var that might
+ * itself be empty, so the caller does not have to branch on that.
+ */
+pub fn authenticate(s Server, token String) Server {
+	Server(..s, token: token)
+}
+
+/**
+ * Serve a read-only JSON snapshot on `GET path`, gated by the same bearer
+ * token as everything else. This is for a dashboard or a script, not a tool a
+ * model calls — it sits outside the JSON-RPC surface entirely. An empty path
+ * (the default) means no such route exists.
+ */
+pub fn status(s Server, path String, run fn() Json) Server {
+	Server(..s, status_path: path, status_run: run)
+}
+
+/**
+ * Serve the dashboard's HTML on `GET path`, with no auth gate. The bearer
+ * token lives inside the page, typed in by whoever is looking at it once it
+ * has loaded — there is no token yet at the point this route is hit, so it
+ * cannot be checked here the way `/status` is. An empty path (the default)
+ * means no such route exists.
+ */
+pub fn dashboard(s Server, path String, html String) Server {
+	Server(..s, dashboard_path: path, dashboard_html: html)
+}
+
+pub fn tool(s Server, t Tool) Server {
+	Server(..s, tools: [..s.tools, t])
+}
+
+pub fn tools(s Server, ts Array(Tool)) Server {
+	Server(..s, tools: [..s.tools, ..ts])
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch.
+// ---------------------------------------------------------------------------
+
+/**
+ * Answer one message. `None` means nothing is owed — the message was a
+ * notification, and a notification is answered with silence.
+ */
+pub fn dispatch(s Server, call Call) Option(Json) {
+	if !rpc.wants_reply(call.id) {
+		None
+	} else if call.method == 'initialize' {
+		Some(rpc.reply(call.id, initialize_result(s)))
+	} else if call.method == 'ping' {
+		Some(rpc.reply(call.id, Object([])))
+	} else if call.method == 'tools/list' {
+		Some(rpc.reply(call.id, Object([('tools', List(array.map(s.tools, describe)))])))
+	} else if call.method == 'tools/call' {
+		Some(invoke(s, call))
+	} else {
+		Some(rpc.fail(call.id, rpc.METHOD_NOT_FOUND, 'no such method: ${call.method}'))
+	}
+}
+
+fn initialize_result(s Server) Json {
+	json.object(
+		[
+			('protocolVersion', Some(Text(PROTOCOL_VERSION))),
+			('capabilities', Some(Object([('tools', Object([]))]))),
+			('serverInfo', Some(Object([('name', Text(s.name)), ('version', Text(s.version))]))),
+			(
+				'instructions',
+				if s.instructions == '' {
+					None
+				} else {
+					Some(Text(s.instructions))
+				},
+			),
+		],
+	)
+}
+
+fn describe(t Tool) Json {
+	Object(
+		[
+			('name', Text(t.name)),
+			('title', Text(t.title)),
+			('description', Text(t.description)),
+			('inputSchema', t.schema),
+		],
+	)
+}
+
+// A tool that does not exist is a protocol error, because no argument the
+// client could have sent would have made it work. A tool that exists and fails
+// is a result with `isError` set — the model is meant to read that one.
+fn invoke(s Server, call Call) Json {
+	name = json.text_at(call.params, 'name', '')
+	arguments = json.get(call.params, 'arguments') or Object([])
+	match array.find(s.tools, fn(t) t.name == name) {
+		None -> rpc.fail(call.id, rpc.INVALID_PARAMS, 'no such tool: ${name}')
+		Some(t) -> rpc.reply(call.id, outcome_result(t.run(arguments)))
+	}
+}
+
+fn outcome_result(o Outcome) Json {
+	match o {
+		Reply(text) -> Object([('content', content(text))])
+		Detailed(text, data) -> Object([('content', content(text)), ('structuredContent', data)])
+		Failed(text) -> Object([('content', content(text)), ('isError', Boolean(True))])
+	}
+}
+
+fn content(text String) Json {
+	List([Object([('type', Text('text')), ('text', Text(text))])])
+}
+
+// ---------------------------------------------------------------------------
+// Transport.
+// ---------------------------------------------------------------------------
+
+const MAX_BODY = 1048576
+
+const NAME_CONTENT_TYPE = <<'Content-Type'>>
+const NAME_ALLOW = <<'Allow'>>
+const NAME_AUTHORIZATION = <<'Authorization'>>
+const NAME_WWW_AUTHENTICATE = <<'WWW-Authenticate'>>
+const NAME_ACCESS_CONTROL_ALLOW_ORIGIN = <<'Access-Control-Allow-Origin'>>
+const NAME_ACCESS_CONTROL_ALLOW_HEADERS = <<'Access-Control-Allow-Headers'>>
+const NAME_ACCESS_CONTROL_ALLOW_METHODS = <<'Access-Control-Allow-Methods'>>
+const VAL_JSON = <<'application/json'>>
+const VAL_HTML = <<'text/html; charset=utf-8'>>
+const VAL_POST = <<'POST'>>
+const VAL_BEARER = <<'Bearer'>>
+const BEARER_PREFIX = <<'Bearer '>>
+const VAL_STAR = <<'*'>>
+const VAL_ALLOW_HEADERS = <<'Authorization, Content-Type'>>
+const VAL_ALLOW_METHODS = <<'GET, POST, DELETE, OPTIONS'>>
+
+/**
+ * Bind the port and serve. Returns once the acceptors are running; they keep
+ * the program alive.
+ */
+pub fn serve(s Server, host String, port Int) Result(Service, NetError) {
+	http.serve(host, port, fn(req) handle(s, req))
+}
+
+/** The handler, exposed so a test can drive it without binding a port. */
+pub fn handle(s Server, req Request) Response {
+	match req.method {
+		// Answered ahead of the auth gate: a preflight carries no Authorization
+		// header by design (that is what it is asking permission to send), so
+		// gating it would fail every cross-origin browser caller before its
+		// real request ever went out — the `/status` dashboard this exists for
+		// included.
+		Options -> preflight()
+		// The dashboard route is checked ahead of the auth gate too, and for a
+		// similar reason: the page carries the token, and the page has to load
+		// before anyone has had the chance to type one in.
+		Get -> if is_dashboard(s, req) {
+			dashboard_response(s)
+		} else if !authorized(s, req) {
+			unauthorized()
+		} else {
+			get(s, req)
+		}
+		_ -> if !authorized(s, req) {
+			unauthorized()
+		} else {
+			match req.method {
+				Post -> post(s, req)
+				// Session teardown, for a client that assumes there is state to drop.
+				Delete -> nothing(204)
+				_ -> refuse(405, 'use POST')
+			}
+		}
+	}
+}
+
+fn preflight() Response {
+	base = nothing(204)
+	Response(
+		..base,
+		headers: [
+			..base.headers,
+			Header(name: NAME_ACCESS_CONTROL_ALLOW_HEADERS, value: VAL_ALLOW_HEADERS),
+			Header(name: NAME_ACCESS_CONTROL_ALLOW_METHODS, value: VAL_ALLOW_METHODS),
+		],
+	)
+}
+
+// The one authenticated GET route this server answers: a plain JSON
+// snapshot, outside the JSON-RPC surface. Anything else gets the same
+// refusal as always — no event stream is ever opened, so there is nothing
+// for a GET to resume.
+fn get(s Server, req Request) Response {
+	if s.status_path != '' && http.path(req) == binary.from_string(s.status_path) {
+		respond(200, s.status_run())
+	} else {
+		refuse(405, 'this server does not open event streams')
+	}
+}
+
+fn is_dashboard(s Server, req Request) Bool {
+	s.dashboard_path != '' && http.path(req) == binary.from_string(s.dashboard_path)
+}
+
+fn dashboard_response(s Server) Response {
+	bytes = binary.from_string(s.dashboard_html)
+	Response(
+		status: 200,
+		headers: [Header(name: NAME_CONTENT_TYPE, value: VAL_HTML)],
+		body: Fixed(binary.byte_size(bytes), body.from_binary(bytes)),
+	)
+}
+
+// Checked ahead of every method, not just POST — a server sitting on a public
+// URL with no auth configured is one typo away from open, so the gate is
+// unconditional rather than something each branch above has to remember.
+fn authorized(s Server, req Request) Bool {
+	if s.token == '' {
+		True
+	} else {
+		match headers.get(req.headers, NAME_AUTHORIZATION) {
+			None -> False
+			Some(value) -> bearer_matches(value, s.token)
+		}
+	}
+}
+
+// `slice_bytes` hands back an empty binary for an out-of-range request rather
+// than erroring, so a value shorter than "Bearer " just fails the prefix
+// compare below instead of needing a length check first.
+fn slice_or_empty(b Binary, at Int, n Int) Binary {
+	result.unwrap(binary.slice_bytes(b, at, n), <<>>)
+}
+
+fn bearer_matches(value Binary, token String) Bool {
+	prefix_len = binary.byte_size(BEARER_PREFIX)
+	slice_or_empty(value, 0, prefix_len) == BEARER_PREFIX &&
+	slice_or_empty(value, prefix_len, binary.byte_size(value) - prefix_len) ==
+	binary.from_string(token)
+}
+
+fn unauthorized() Response {
+	base = respond(401, rpc.fail(NoId, rpc.INVALID_REQUEST, 'missing or invalid bearer token'))
+	Response(
+		..base,
+		headers: [..base.headers, Header(name: NAME_WWW_AUTHENTICATE, value: VAL_BEARER)],
+	)
+}
+
+fn post(s Server, req Request) Response {
+	match body.collect(req.body, MAX_BODY) {
+		Err(_) -> respond(400, rpc.fail(NoId, rpc.PARSE_ERROR, 'could not read the body'))
+		Ok(bytes) -> match rpc.decode(bytes) {
+			Err(f) -> respond(400, rpc.fail_with(f))
+			Ok(call) -> match dispatch(s, call) {
+				// A notification is accepted and not answered.
+				None -> nothing(202)
+				Some(reply) -> respond(200, reply)
+			}
+		}
+	}
+}
+
+// The CORS header on every response, not just `/status`'s: a browser only
+// reads a response cross-origin if this is on the response, not just the
+// preflight, and an error response (401, in particular) needs to be legible
+// to a browser dashboard the same as a successful one.
+fn respond(status Int, value Json) Response {
+	bytes = json.encode_binary(value)
+	Response(
+		status: status,
+		headers: [
+			Header(name: NAME_CONTENT_TYPE, value: VAL_JSON),
+			Header(name: NAME_ACCESS_CONTROL_ALLOW_ORIGIN, value: VAL_STAR),
+		],
+		body: Fixed(binary.byte_size(bytes), body.from_binary(bytes)),
+	)
+}
+
+fn refuse(status Int, why String) Response {
+	base = respond(status, rpc.fail(NoId, rpc.INVALID_REQUEST, why))
+	Response(..base, headers: [..base.headers, Header(name: NAME_ALLOW, value: VAL_POST)])
+}
+
+fn nothing(status Int) Response {
+	Response(
+		status: status,
+		headers: [Header(name: NAME_ACCESS_CONTROL_ALLOW_ORIGIN, value: VAL_STAR)],
+		body: Fixed(0, body.from_binary(<<>>)),
+	)
+}

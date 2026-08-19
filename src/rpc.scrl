@@ -1,0 +1,109 @@
+// JSON-RPC 2.0, the envelope MCP speaks in.
+//
+// Only what MCP uses: a single request or notification per message, never a
+// batch — the 2025-06-18 revision removed batching, so an array here is an
+// invalid request rather than a shape to support.
+//
+// The id is a type rather than a `Json`, because the distinction it carries is
+// load-bearing: a message with no id is a notification, and a notification is
+// answered with silence, not with a response whose id is null.
+
+import scarlet/binary
+import ./json.{Json, Null, Num, Object, Text}
+
+pub type Id {
+	NumId(value Int)
+	TextId(value String)
+	/** A notification: no reply is owed. */
+	NoId
+}
+
+pub type Call {
+	method String
+	/** The `params` member, or `Null` when absent. */
+	params Json
+	id Id
+}
+
+// The standard codes. `INVALID_PARAMS` is for a malformed call; a tool that
+// runs and fails is not an error here — it is a result with `isError` set, so
+// the model can read what went wrong and try again.
+pub const PARSE_ERROR = -32700
+pub const INVALID_REQUEST = -32600
+pub const METHOD_NOT_FOUND = -32601
+pub const INVALID_PARAMS = -32602
+pub const INTERNAL_ERROR = -32603
+
+pub type Failure {
+	code Int
+	message String
+	/** The id to answer with, which is `NoId` when it could not be read. */
+	id Id
+}
+
+/** Read one message. */
+pub fn decode(body Binary) Result(Call, Failure) {
+	match json.parse(body) {
+		Err(e) -> Err(Failure(code: PARSE_ERROR, message: json.show_error(e), id: NoId))
+		Ok(doc) -> read_call(doc)
+	}
+}
+
+fn read_call(doc Json) Result(Call, Failure) {
+	id = read_id(doc)
+	match doc {
+		Object(_) -> match json.get(doc, 'method') {
+			Some(Text(method)) ->
+				Ok(Call(method: method, params: json.get(doc, 'params') or Null, id: id))
+			_ -> Err(Failure(code: INVALID_REQUEST, message: 'missing method', id: id))
+		}
+		_ -> Err(Failure(code: INVALID_REQUEST, message: 'expected a json-rpc object', id: NoId))
+	}
+}
+
+// A missing id and a null id both mean notification. Anything that is not a
+// string or a number is not a usable id either, so it is treated the same way:
+// there is nothing to address a reply to.
+fn read_id(doc Json) Id {
+	match json.get(doc, 'id') {
+		Some(Num(n)) -> NumId(n)
+		Some(Text(s)) -> TextId(s)
+		_ -> NoId
+	}
+}
+
+fn id_json(id Id) Json {
+	match id {
+		NumId(n) -> Num(n)
+		TextId(s) -> Text(s)
+		NoId -> Null
+	}
+}
+
+/** A successful response. */
+pub fn reply(id Id, value Json) Json {
+	Object([('jsonrpc', Text('2.0')), ('id', id_json(id)), ('result', value)])
+}
+
+/** An error response. */
+pub fn fail(id Id, code Int, message String) Json {
+	Object(
+		[
+			('jsonrpc', Text('2.0')),
+			('id', id_json(id)),
+			('error', Object([('code', Num(code)), ('message', Text(message))])),
+		],
+	)
+}
+
+pub fn fail_with(f Failure) Json {
+	fail(f.id, f.code, f.message)
+}
+
+/** Whether a reply is owed at all. */
+pub fn wants_reply(id Id) Bool {
+	match id {
+		NoId -> False
+		_ -> True
+	}
+}
