@@ -30,12 +30,24 @@ import scarlet/net.{Service}
 import scarlet/net/error.{NetError}
 import scarlet/option
 import scarlet/result
+import scarlet/string
 import scarlet/json.{Boolean, Json, List, Null, Object, Str}
 import ./jsonx
 import ./rpc.{Call, Id, NoId}
 
 /** The revision of MCP this server speaks. */
 pub const PROTOCOL_VERSION = '2025-06-18'
+
+/** Who an authenticated request is from. `scope` is the OAuth scope
+ * string, space-separated; `scope_has` answers tier questions about it. */
+pub type Caller {
+	Caller(user String, scope String)
+}
+
+/** Whether `scope` (space-separated) contains the token `want`. */
+pub fn scope_has(scope String, want String) Bool {
+	array.contains(string.split(scope, ' '), want)
+}
 
 /** What a tool hands back. */
 pub type Outcome {
@@ -59,8 +71,13 @@ pub type Tool {
 	description String
 	/** JSON Schema for the arguments; see `./schema`. */
 	schema Json
-	/** Run it. The argument is the `arguments` object, `Object([])` if absent. */
-	run fn(Json) Outcome
+	/** A scope token the caller must hold, or `''` for everyone. A tool a
+	 * caller lacks the scope for is not listed and not callable — for that
+	 * caller it does not exist. */
+	requires String
+	/** Run it, as `caller`. The second argument is the `arguments` object,
+	 * `Object([])` if absent. */
+	run fn(Caller, Json) Outcome
 }
 
 pub type Server {
@@ -70,8 +87,9 @@ pub type Server {
 	tools Array(Tool)
 	/** A bearer token every request must carry. Empty means auth is off. */
 	token String
-	/** A host-supplied bearer check. Consulted only when `use_check` is set. */
-	check fn(String) Bool
+	/** A host-supplied bearer check: token text to caller. Consulted only
+	 * when `use_check` is set. */
+	check fn(String) Option(Caller)
 	/** Whether `check` replaces the static `token` comparison. */
 	use_check Bool
 	/** The WWW-Authenticate value for a 401. Empty means plain `Bearer`. */
@@ -93,7 +111,7 @@ pub fn new(name String, version String) Server {
 		instructions: '',
 		tools: [],
 		token: '',
-		check: fn(_) False,
+		check: fn(_) None,
 		use_check: False,
 		challenge: '',
 		status_path: '',
@@ -125,7 +143,7 @@ pub fn authenticate(s Server, token String) Server {
  * should come from `resource.challenge`, so a client can discover the
  * authorization server (RFC 9728).
  */
-pub fn authenticate_via(s Server, check fn(String) Bool, challenge String) Server {
+pub fn authenticate_via(s Server, check fn(String) Option(Caller), challenge String) Server {
 	Server(..s, check: check, use_check: True, challenge: challenge)
 }
 
@@ -166,7 +184,7 @@ pub fn tools(s Server, ts Array(Tool)) Server {
  * Answer one message. `None` means nothing is owed — the message was a
  * notification, and a notification is answered with silence.
  */
-pub fn dispatch(s Server, call Call) Option(Json) {
+pub fn dispatch(s Server, caller Caller, call Call) Option(Json) {
 	if !rpc.wants_reply(call.id) {
 		None
 	} else if call.method == 'initialize' {
@@ -174,9 +192,11 @@ pub fn dispatch(s Server, call Call) Option(Json) {
 	} else if call.method == 'ping' {
 		Some(rpc.reply(call.id, Object([])))
 	} else if call.method == 'tools/list' {
-		Some(rpc.reply(call.id, Object([('tools', List(array.map(s.tools, describe)))])))
+		Some(rpc.reply(call.id, Object([
+			('tools', List(array.map(array.filter(s.tools, fn(t) allowed(caller, t)), describe))),
+		])))
 	} else if call.method == 'tools/call' {
-		Some(invoke(s, call))
+		Some(invoke(s, caller, call))
 	} else {
 		Some(rpc.fail(call.id, rpc.METHOD_NOT_FOUND, 'no such method: ${call.method}'))
 	}
@@ -214,12 +234,14 @@ fn describe(t Tool) Json {
 // A tool that does not exist is a protocol error, because no argument the
 // client could have sent would have made it work. A tool that exists and fails
 // is a result with `isError` set — the model is meant to read that one.
-fn invoke(s Server, call Call) Json {
+fn invoke(s Server, caller Caller, call Call) Json {
 	name = jsonx.text_at(call.params, 'name', '')
 	arguments = jsonx.get(call.params, 'arguments') or Object([])
-	match array.find(s.tools, fn(t) t.name == name) {
+	match array.find(s.tools, fn(t) t.name == name && allowed(caller, t)) {
+		// A tool outside the caller's scope answers exactly like one that
+		// does not exist: it is not part of their world.
 		None -> rpc.fail(call.id, rpc.INVALID_PARAMS, 'no such tool: ${name}')
-		Some(t) -> rpc.reply(call.id, outcome_result(t.run(arguments)))
+		Some(t) -> rpc.reply(call.id, outcome_result(t.run(caller, arguments)))
 	}
 }
 
@@ -279,16 +301,16 @@ pub fn handle(s Server, req Request) Response {
 		// before anyone has had the chance to type one in.
 		Get -> if is_dashboard(s, req) {
 			dashboard_response(s)
-		} else if !authorized(s, req) {
-			unauthorized(s)
 		} else {
-			get(s, req)
+			match authorized(s, req) {
+				None -> unauthorized(s)
+				Some(_) -> get(s, req)
+			}
 		}
-		_ -> if !authorized(s, req) {
-			unauthorized(s)
-		} else {
-			match req.method {
-				Post -> post(s, req)
+		_ -> match authorized(s, req) {
+			None -> unauthorized(s)
+			Some(caller) -> match req.method {
+				Post -> post(s, caller, req)
 				// Session teardown, for a client that assumes there is state to drop.
 				Delete -> nothing(204)
 				_ -> refuse(405, 'use POST')
@@ -337,20 +359,33 @@ fn dashboard_response(s Server) Response {
 // Checked ahead of every method, not just POST — a server sitting on a public
 // URL with no auth configured is one typo away from open, so the gate is
 // unconditional rather than something each branch above has to remember.
-fn authorized(s Server, req Request) Bool {
+fn authorized(s Server, req Request) Option(Caller) {
 	if s.use_check {
 		match bearer_text(req) {
 			Some(t) -> s.check(t)
-			None -> False
+			None -> None
 		}
 	} else if s.token == '' {
-		True
+		Some(anonymous())
 	} else {
 		match headers.get(req.headers, NAME_AUTHORIZATION) {
-			None -> False
-			Some(value) -> bearer_matches(value, s.token)
+			None -> None
+			Some(value) -> match bearer_matches(value, s.token) {
+				True -> Some(anonymous())
+				False -> None
+			}
 		}
 	}
+}
+
+// Static-token mode has no identity to offer; every tool is visible.
+fn anonymous() Caller {
+	Caller(user: '', scope: '*')
+}
+
+fn allowed(c Caller, t Tool) Bool {
+	Caller(_, scope) = c
+	t.requires == '' || scope == '*' || scope_has(scope, t.requires)
 }
 
 /** The token text after `Bearer `, when the header is well-formed. */
@@ -399,12 +434,12 @@ fn unauthorized(s Server) Response {
 	)
 }
 
-fn post(s Server, req Request) Response {
+fn post(s Server, caller Caller, req Request) Response {
 	match body.collect(req.body, MAX_BODY) {
 		Err(_) -> respond(400, rpc.fail(NoId, rpc.PARSE_ERROR, 'could not read the body'))
 		Ok(bytes) -> match rpc.decode(bytes) {
 			Err(f) -> respond(400, rpc.fail_with(f))
-			Ok(call) -> match dispatch(s, call) {
+			Ok(call) -> match dispatch(s, caller, call) {
 				// A notification is accepted and not answered.
 				None -> nothing(202)
 				Some(reply) -> respond(200, reply)
