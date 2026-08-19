@@ -18,4 +18,4 @@ s = server.authenticate(server.tools(server.new('myapp', '0.1.0'), my_tools()), 
 server.serve(s, '0.0.0.0', 7823)
 ```
 
-Ships its own json module (`src/json.scrl`): parse-to-values with `text_at`/`int_at` accessors. Vendored via git submodule for now.
+Auth: static bearer via `authenticate`, or `authenticate_via` with your own check and a `WWW-Authenticate` challenge — pair it with `scarlet/oauth2` (in the stdlib) for the full MCP authorization spec. Vendored via git submodule for now.
