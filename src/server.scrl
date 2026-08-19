@@ -21,6 +21,7 @@
 
 import scarlet/array
 import scarlet/binary
+import scarlet/crypto
 import scarlet/http.{Delete, Fixed, Get, Options, Post, Request, Response}
 import scarlet/http/body
 import scarlet/http/headers
@@ -69,6 +70,12 @@ pub type Server {
 	tools Array(Tool)
 	/** A bearer token every request must carry. Empty means auth is off. */
 	token String
+	/** A host-supplied bearer check. Consulted only when `use_check` is set. */
+	check fn(String) Bool
+	/** Whether `check` replaces the static `token` comparison. */
+	use_check Bool
+	/** The WWW-Authenticate value for a 401. Empty means plain `Bearer`. */
+	challenge String
 	/** The path a `GET` returns a JSON snapshot on. Empty means there is none. */
 	status_path String
 	/** What to run for that snapshot. Ignored while `status_path` is empty. */
@@ -86,6 +93,9 @@ pub fn new(name String, version String) Server {
 		instructions: '',
 		tools: [],
 		token: '',
+		check: fn(_) False,
+		use_check: False,
+		challenge: '',
 		status_path: '',
 		status_run: fn() Null,
 		dashboard_path: '',
@@ -106,6 +116,17 @@ pub fn guide(s Server, text String) Server {
  */
 pub fn authenticate(s Server, token String) Server {
 	Server(..s, token: token)
+}
+
+/**
+ * Replace the static token with a host-supplied check over the bearer text —
+ * the multi-user mode, where the host looks tokens up in its own store. The
+ * challenge is the WWW-Authenticate value a 401 carries; for MCP-spec auth it
+ * should come from `resource.challenge`, so a client can discover the
+ * authorization server (RFC 9728).
+ */
+pub fn authenticate_via(s Server, check fn(String) Bool, challenge String) Server {
+	Server(..s, check: check, use_check: True, challenge: challenge)
 }
 
 /**
@@ -259,12 +280,12 @@ pub fn handle(s Server, req Request) Response {
 		Get -> if is_dashboard(s, req) {
 			dashboard_response(s)
 		} else if !authorized(s, req) {
-			unauthorized()
+			unauthorized(s)
 		} else {
 			get(s, req)
 		}
 		_ -> if !authorized(s, req) {
-			unauthorized()
+			unauthorized(s)
 		} else {
 			match req.method {
 				Post -> post(s, req)
@@ -317,12 +338,32 @@ fn dashboard_response(s Server) Response {
 // URL with no auth configured is one typo away from open, so the gate is
 // unconditional rather than something each branch above has to remember.
 fn authorized(s Server, req Request) Bool {
-	if s.token == '' {
+	if s.use_check {
+		match bearer_text(req) {
+			Some(t) -> s.check(t)
+			None -> False
+		}
+	} else if s.token == '' {
 		True
 	} else {
 		match headers.get(req.headers, NAME_AUTHORIZATION) {
 			None -> False
 			Some(value) -> bearer_matches(value, s.token)
+		}
+	}
+}
+
+/** The token text after `Bearer `, when the header is well-formed. */
+fn bearer_text(req Request) Option(String) {
+	value <- option.then(headers.get(req.headers, NAME_AUTHORIZATION))
+	prefix_len = binary.byte_size(BEARER_PREFIX)
+	match slice_or_empty(value, 0, prefix_len) == BEARER_PREFIX {
+		False -> None
+		True -> match binary.to_string(
+			slice_or_empty(value, prefix_len, binary.byte_size(value) - prefix_len),
+		) {
+			Ok(t) -> Some(t)
+			Err(Nil) -> None
 		}
 	}
 }
@@ -334,18 +375,27 @@ fn slice_or_empty(b Binary, at Int, n Int) Binary {
 	result.unwrap(binary.slice_bytes(b, at, n), <<>>)
 }
 
+// The prefix compare is plain `==` — "Bearer " is not a secret. The token
+// compare is not: `const_eq` runs in time set by the lengths alone, so a
+// probe learns nothing from how much of a guess matched.
 fn bearer_matches(value Binary, token String) Bool {
 	prefix_len = binary.byte_size(BEARER_PREFIX)
 	slice_or_empty(value, 0, prefix_len) == BEARER_PREFIX &&
-	slice_or_empty(value, prefix_len, binary.byte_size(value) - prefix_len) ==
-	binary.from_string(token)
+	crypto.const_eq(
+		slice_or_empty(value, prefix_len, binary.byte_size(value) - prefix_len),
+		binary.from_string(token),
+	)
 }
 
-fn unauthorized() Response {
+fn unauthorized(s Server) Response {
 	base = respond(401, rpc.fail(NoId, rpc.INVALID_REQUEST, 'missing or invalid bearer token'))
+	value = match s.challenge {
+		'' -> VAL_BEARER
+		c -> binary.from_string(c)
+	}
 	Response(
 		..base,
-		headers: [..base.headers, Header(name: NAME_WWW_AUTHENTICATE, value: VAL_BEARER)],
+		headers: [..base.headers, Header(name: NAME_WWW_AUTHENTICATE, value: value)],
 	)
 }
 
