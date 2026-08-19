@@ -9,7 +9,8 @@
 // answered with silence, not with a response whose id is null.
 
 import scarlet/binary
-import ./json.{Json, Null, Num, Object, Text}
+import scarlet/json.{Integer, Json, Null, Object, Str}
+import ./jsonx
 
 pub type Id {
 	NumId(value Int)
@@ -43,18 +44,18 @@ pub type Failure {
 
 /** Read one message. */
 pub fn decode(body Binary) Result(Call, Failure) {
-	match json.parse(body) {
-		Err(e) -> Err(Failure(code: PARSE_ERROR, message: json.show_error(e), id: NoId))
-		Ok(doc) -> read_call(doc)
+	match json.parse_binary(body) {
+		Err(e) -> Err(Failure(code: PARSE_ERROR, message: json.parse_error_message(e), id: NoId))
+		Ok(doc) -> read_call(json.to_json(doc))
 	}
 }
 
 fn read_call(doc Json) Result(Call, Failure) {
 	id = read_id(doc)
 	match doc {
-		Object(_) -> match json.get(doc, 'method') {
-			Some(Text(method)) ->
-				Ok(Call(method: method, params: json.get(doc, 'params') or Null, id: id))
+		Object(_) -> match jsonx.get(doc, 'method') {
+			Some(Str(method)) ->
+				Ok(Call(method: method, params: jsonx.get(doc, 'params') or Null, id: id))
 			_ -> Err(Failure(code: INVALID_REQUEST, message: 'missing method', id: id))
 		}
 		_ -> Err(Failure(code: INVALID_REQUEST, message: 'expected a json-rpc object', id: NoId))
@@ -65,33 +66,33 @@ fn read_call(doc Json) Result(Call, Failure) {
 // string or a number is not a usable id either, so it is treated the same way:
 // there is nothing to address a reply to.
 fn read_id(doc Json) Id {
-	match json.get(doc, 'id') {
-		Some(Num(n)) -> NumId(n)
-		Some(Text(s)) -> TextId(s)
+	match jsonx.get(doc, 'id') {
+		Some(Integer(n)) -> NumId(n)
+		Some(Str(s)) -> TextId(s)
 		_ -> NoId
 	}
 }
 
 fn id_json(id Id) Json {
 	match id {
-		NumId(n) -> Num(n)
-		TextId(s) -> Text(s)
+		NumId(n) -> Integer(n)
+		TextId(s) -> Str(s)
 		NoId -> Null
 	}
 }
 
 /** A successful response. */
 pub fn reply(id Id, value Json) Json {
-	Object([('jsonrpc', Text('2.0')), ('id', id_json(id)), ('result', value)])
+	Object([('jsonrpc', Str('2.0')), ('id', id_json(id)), ('result', value)])
 }
 
 /** An error response. */
 pub fn fail(id Id, code Int, message String) Json {
 	Object(
 		[
-			('jsonrpc', Text('2.0')),
+			('jsonrpc', Str('2.0')),
 			('id', id_json(id)),
-			('error', Object([('code', Num(code)), ('message', Text(message))])),
+			('error', Object([('code', Integer(code)), ('message', Str(message))])),
 		],
 	)
 }

@@ -5,15 +5,16 @@
 // schema that drifts from the code that reads the arguments.
 
 import scarlet/array
-import ./json.{Boolean, Json, List, Num, Object, Text}
+import scarlet/json.{Boolean, Integer, Json, List, Object, Str}
+import ./jsonx
 
 /** An object schema: named properties, and which of them are required. */
 pub fn object(properties Array((String, Json)), required Array(String)) Json {
 	Object(
 		[
-			('type', Text('object')),
+			('type', Str('object')),
 			('properties', Object(properties)),
-			('required', json.texts(required)),
+			('required', jsonx.texts(required)),
 			('additionalProperties', Boolean(False)),
 		],
 	)
@@ -25,41 +26,41 @@ pub fn nothing() Json {
 }
 
 pub fn text(description String) Json {
-	Object([('type', Text('string')), ('description', Text(description))])
+	Object([('type', Str('string')), ('description', Str(description))])
 }
 
 pub fn integer(description String) Json {
-	Object([('type', Text('integer')), ('description', Text(description))])
+	Object([('type', Str('integer')), ('description', Str(description))])
 }
 
 pub fn boolean(description String) Json {
-	Object([('type', Text('boolean')), ('description', Text(description))])
+	Object([('type', Str('boolean')), ('description', Str(description))])
 }
 
 /** A string constrained to a fixed set of values. */
 pub fn one_of(values Array(String), description String) Json {
 	Object(
-		[('type', Text('string')), ('enum', json.texts(values)), ('description', Text(description))],
+		[('type', Str('string')), ('enum', jsonx.texts(values)), ('description', Str(description))],
 	)
 }
 
 pub fn list_of(items Json, description String) Json {
-	Object([('type', Text('array')), ('items', items), ('description', Text(description))])
+	Object([('type', Str('array')), ('items', items), ('description', Str(description))])
 }
 
 /** A list of strings, the shape most of Heddle's list arguments take. */
 pub fn texts(description String) Json {
-	list_of(Object([('type', Text('string'))]), description)
+	list_of(Object([('type', Str('string'))]), description)
 }
 
 /** An integer with a floor and a ceiling, for the scope and priority scales. */
 pub fn ranged(low Int, high Int, description String) Json {
 	Object(
 		[
-			('type', Text('integer')),
-			('minimum', Num(low)),
-			('maximum', Num(high)),
-			('description', Text(description)),
+			('type', Str('integer')),
+			('minimum', Integer(low)),
+			('maximum', Integer(high)),
+			('description', Str(description)),
 		],
 	)
 }

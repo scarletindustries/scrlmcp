@@ -1,0 +1,77 @@
+// Value-side accessors for `scarlet/json`.
+//
+// The stdlib parses with SIMD into an opaque `Doc` and its accessors live
+// there; once `to_json` lifts a document into `Json` values, walking those
+// values is on you. This module is that walk: the `get`/`text_at` ergonomics
+// this library wants, over plain `Json`.
+
+import scarlet/array
+import scarlet/binary
+import scarlet/json.{Json, List, Object, Str}
+import scarlet/option
+
+/** The first member named `key`, or `None`. Not an object: `None`. */
+pub fn get(j Json, key String) Option(Json) {
+	match j {
+		Object(members) -> option.map(
+			array.find(members, fn(m) {
+				(k, _) = m
+				k == key
+			}),
+			fn(m) {
+				(_, v) = m
+				v
+			},
+		)
+		_ -> None
+	}
+}
+
+pub fn text_of(j Json) Option(String) {
+	match j {
+		Str(s) -> Some(s)
+		_ -> None
+	}
+}
+
+pub fn int_of(j Json) Option(Int) {
+	match j {
+		json.Integer(n) -> Some(n)
+		_ -> None
+	}
+}
+
+pub fn text_at(j Json, key String, fallback String) String {
+	option.then(get(j, key), text_of) or fallback
+}
+
+pub fn int_at(j Json, key String, fallback Int) Int {
+	option.then(get(j, key), int_of) or fallback
+}
+
+pub fn list_of(j Json) Option(Array(Json)) {
+	match j {
+		List(items) -> Some(items)
+		_ -> None
+	}
+}
+
+/** A json array of strings. */
+pub fn texts(values Array(String)) Json {
+	List(array.map(values, Str))
+}
+
+/** An object from optional members: `None` values are simply left out. */
+pub fn object(members Array((String, Option(Json)))) Json {
+	Object(array.fold(members, [], fn(acc, m) {
+		(k, v) = m
+		match v {
+			Some(j) -> [..acc, (k, j)]
+			None -> acc
+		}
+	}))
+}
+
+pub fn encode_binary(j Json) Binary {
+	binary.from_string(json.encode(j))
+}

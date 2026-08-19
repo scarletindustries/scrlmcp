@@ -29,7 +29,8 @@ import scarlet/net.{Service}
 import scarlet/net/error.{NetError}
 import scarlet/option
 import scarlet/result
-import ./json.{Boolean, Json, List, Null, Object, Text}
+import scarlet/json.{Boolean, Json, List, Null, Object, Str}
+import ./jsonx
 import ./rpc.{Call, Id, NoId}
 
 /** The revision of MCP this server speaks. */
@@ -161,17 +162,17 @@ pub fn dispatch(s Server, call Call) Option(Json) {
 }
 
 fn initialize_result(s Server) Json {
-	json.object(
+	jsonx.object(
 		[
-			('protocolVersion', Some(Text(PROTOCOL_VERSION))),
+			('protocolVersion', Some(Str(PROTOCOL_VERSION))),
 			('capabilities', Some(Object([('tools', Object([]))]))),
-			('serverInfo', Some(Object([('name', Text(s.name)), ('version', Text(s.version))]))),
+			('serverInfo', Some(Object([('name', Str(s.name)), ('version', Str(s.version))]))),
 			(
 				'instructions',
 				if s.instructions == '' {
 					None
 				} else {
-					Some(Text(s.instructions))
+					Some(Str(s.instructions))
 				},
 			),
 		],
@@ -181,9 +182,9 @@ fn initialize_result(s Server) Json {
 fn describe(t Tool) Json {
 	Object(
 		[
-			('name', Text(t.name)),
-			('title', Text(t.title)),
-			('description', Text(t.description)),
+			('name', Str(t.name)),
+			('title', Str(t.title)),
+			('description', Str(t.description)),
 			('inputSchema', t.schema),
 		],
 	)
@@ -193,8 +194,8 @@ fn describe(t Tool) Json {
 // client could have sent would have made it work. A tool that exists and fails
 // is a result with `isError` set — the model is meant to read that one.
 fn invoke(s Server, call Call) Json {
-	name = json.text_at(call.params, 'name', '')
-	arguments = json.get(call.params, 'arguments') or Object([])
+	name = jsonx.text_at(call.params, 'name', '')
+	arguments = jsonx.get(call.params, 'arguments') or Object([])
 	match array.find(s.tools, fn(t) t.name == name) {
 		None -> rpc.fail(call.id, rpc.INVALID_PARAMS, 'no such tool: ${name}')
 		Some(t) -> rpc.reply(call.id, outcome_result(t.run(arguments)))
@@ -210,7 +211,7 @@ fn outcome_result(o Outcome) Json {
 }
 
 fn content(text String) Json {
-	List([Object([('type', Text('text')), ('text', Text(text))])])
+	List([Object([('type', Str('text')), ('text', Str(text))])])
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +368,7 @@ fn post(s Server, req Request) Response {
 // preflight, and an error response (401, in particular) needs to be legible
 // to a browser dashboard the same as a successful one.
 fn respond(status Int, value Json) Response {
-	bytes = json.encode_binary(value)
+	bytes = jsonx.encode_binary(value)
 	Response(
 		status: status,
 		headers: [
